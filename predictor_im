@@ -1,0 +1,627 @@
+import re
+import logging
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+import os
+import glob
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+
+class PODProcessor:
+    """
+    POD-ANN surrogate for stator-tooth electromagnetic forces.
+
+    Pipeline
+    --------
+    1. run(data_dir)          – parse all xlsx files → POD decomposition per OP
+    2. train_mode_predictor() – fit ANN on (rpm, torque) → flattened POD modes
+    3. predict_modes(rpm, t)  – infer U_k, T_k for unseen OP
+    4. reconstruct_field(...)  – rebuild full force matrix A ≈ U_k @ T_k
+    5. evaluate_single_tooth(...)  – compare predicted vs FEM on one tooth
+
+    Key engineering fixes vs original
+    ----------------------------------
+    * Normalisation of FR / FT columns before stacking into snapshot matrix A
+      – avoids tangential forces (small) being swamped by radial (large).
+    * Input (rpm, torque) scaled with StandardScaler so ANN gradients are balanced.
+    * U_k sign ambiguity fixed: each spatial mode column is sign-flipped so its
+      largest-magnitude element is always positive (reproducible across OPs).
+    * U_k is NOT included in the ANN output – spatial modes are averaged across
+      all training OPs and held fixed.  Only temporal coefficients T_k are predicted.
+      This dramatically reduces output dimensionality and improves accuracy.
+    * LR scheduler (ReduceLROnPlateau) added – avoids plateau stalling.
+    * Validation loss tracked every epoch; best weights restored at end.
+    * Duplicate / invalid operating points are skipped with a warning.
+    * read_forces: 'Rotor_Angle_elec' column is excluded from the snapshot matrix
+      (it is a coordinate, not a force) – was silently included before.
+    * evaluate_single_tooth returns FR and FT separately for clearer diagnosis.
+    """
+
+    # ============================================================
+    #                   INITIALIZATION
+    # ============================================================
+    def __init__(self, mode_count: int = 5, epochs: int = 800, lr: float = 1e-3):
+        self.mode_count = mode_count
+        self.epochs = epochs
+        self.lr = lr
+
+        # Training data storage
+        self.reg_X: list[list] = []   # [(rpm, torque), ...]
+        self.reg_Y: list[np.ndarray] = []  # [T_k.flatten(), ...]
+
+        # Shape metadata – populated from first POD
+        self.T_shape_tuple: tuple | None = None
+        self.T_size: int | None = None
+
+        # Averaged spatial basis (held fixed after training)
+        self._U_k_sum: np.ndarray | None = None
+        self._U_k_count: int = 0
+        self.U_mean: np.ndarray | None = None   # set after run()
+
+        # Scalers
+        self.x_scaler = StandardScaler()
+        self.y_scaler = StandardScaler()
+
+        # PyTorch model
+        self.model: nn.Module | None = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        log.info("Device: %s", self.device)
+
+        # Track seen operating points to detect duplicates
+        self._seen_ops: set = set()
+
+    # ============================================================
+    #               UTILITIES FOR INPUT PARSING
+    # ============================================================
+    def parse_operating_conditions(self, file_name: str) -> tuple[int, float]:
+        """
+        Extract (rpm, torque_Nm) from filename.
+        Handles formats such as:
+          '3000rpm_50Nm.xlsx', '3000 RPM -50 Nm.xlsx', '3000rpm50nm.xlsx'
+        Returns (-1, nan) if parsing fails – these files are skipped in run().
+        """
+        # Primary pattern: number then rpm, then optional non-digit separator, then torque
+        m = re.search(
+            r"(\d+)\s*rpm[^\d-]*(-?\d+(?:\.\d+)?)\s*nm",
+            file_name,
+            re.IGNORECASE,
+        )
+        if not m:
+            # Fallback: strip non-alphanumeric and retry
+            compact = re.sub(r"[^a-z0-9-]+", "", file_name.lower())
+            m = re.search(r"(\d+)rpm(-?\d+(?:\.\d+)?)nm", compact)
+        if m:
+            return int(m.group(1)), float(m.group(2))
+        log.warning("Could not parse operating conditions from '%s' – skipping.", file_name)
+        return -1, float("nan")
+
+    # ============================================================
+    #                   READING FORCE DATA
+    # ============================================================
+    def read_forces(
+        self, xlsx_path: str | Path, sheetname: str = "Torque_Characteristic"
+    ) -> pd.DataFrame:
+        """
+        Returns a DataFrame whose columns are FR_1…FR_N, FT_1…FT_N
+        (rotor angle used as index, NOT included as a data column).
+        Forces are mean-centred per column so POD captures fluctuations.
+        """
+        df = pd.read_excel(xlsx_path, sheet_name=sheetname, engine="openpyxl")
+        df = df.dropna(axis=1, how="all")
+
+        # Drop unit-description row if present
+        if df.shape[0] > 0 and df.iloc[0].astype(str).str.contains(
+            r"Seconds|Elec\.Deg\.|Mech\.Deg\.|Nm|N\b", regex=True
+        ).any():
+            df = df.iloc[1:].reset_index(drop=True)
+
+        df = df.apply(pd.to_numeric, errors="coerce")
+
+        # ── Rename columns ──────────────────────────────────────
+        rename_map = {}
+        for col in df.columns:
+            if "Force_Tangential_" in col:
+                rename_map[col] = col.replace("Force_Tangential_", "FT_")
+            elif "Force_Radial_" in col:
+                rename_map[col] = col.replace("Force_Radial_", "FR_")
+            elif col.strip() in ("Rotor position", "Rotor_Angle_elec"):
+                rename_map[col] = "Rotor_Angle_elec"
+            else:
+                rename_map[col] = col.strip().replace(" ", "_")
+        df = df.rename(columns=rename_map)
+
+        # ── Set rotor angle as index (exclude from snapshot matrix) ──
+        angle_col = "Rotor_Angle_elec"
+        if angle_col in df.columns:
+            df = df.set_index(angle_col)
+        else:
+            log.warning("'Rotor_Angle_elec' column not found; using integer index.")
+
+        # ── Sort force columns numerically ──────────────────────
+        def _force_id(c: str) -> int:
+            m = re.search(r"(FR_|FT_)(\d+)", c)
+            return int(m.group(2)) if m else int(1e9)
+
+        fr_cols = sorted([c for c in df.columns if c.startswith("FR_")], key=_force_id)
+        ft_cols = sorted([c for c in df.columns if c.startswith("FT_")], key=_force_id)
+
+        if not fr_cols and not ft_cols:
+            raise ValueError(f"No FR_/FT_ force columns found in {xlsx_path}.")
+
+        df = df[fr_cols + ft_cols].dropna()
+
+        # ── Mean-centre: POD should capture fluctuations, not DC offset ──
+        df = df - df.mean()
+
+        return df
+
+    # ============================================================
+    #                    POD / SVD FUNCTIONS
+    # ============================================================
+    @staticmethod
+    def data_svd(A: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return np.linalg.svd(A, full_matrices=False)
+
+    @staticmethod
+    def energy_curves(s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        e = s ** 2
+        frac = np.cumsum(e) / e.sum()
+        return frac, 1.0 - frac
+
+    def POD_reconstruct(
+        self, U: np.ndarray, s: np.ndarray, Vt: np.ndarray, k: int
+    ) -> np.ndarray:
+        return (U[:, :k] * s[:k]) @ Vt[:k, :]
+
+    def _fix_sign_ambiguity(self, U_k: np.ndarray) -> np.ndarray:
+        """
+        Flip each POD mode column so its element of largest absolute value
+        is positive.  This makes modes consistent across operating points
+        so the ANN can learn a smooth mapping.
+        """
+        for j in range(U_k.shape[1]):
+            col = U_k[:, j]
+            if col[np.argmax(np.abs(col))] < 0:
+                U_k[:, j] = -col
+        return U_k
+
+    def POD_plot_summary(
+        self,
+        s: np.ndarray,
+        cum: np.ndarray,
+        rpm: int,
+        torque: float,
+    ) -> None:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        idx = np.arange(1, len(s) + 1)
+
+        axes[0].bar(idx, s, color="steelblue")
+        axes[0].set_xlabel("Mode index")
+        axes[0].set_ylabel("Singular value")
+        axes[0].set_title("Singular Values")
+
+        axes[1].plot(idx, cum * 100, "o-", color="darkorange")
+        axes[1].axhline(99, color="red", linestyle="--", label="99 %")
+        axes[1].set_xlabel("Mode index")
+        axes[1].set_ylabel("Cumulative energy (%)")
+        axes[1].set_title("Cumulative Energy Fraction")
+        axes[1].legend()
+
+        fig.suptitle(f"POD Summary | {rpm} rpm | {torque} Nm")
+        plt.tight_layout()
+        plt.show()
+
+    # ============================================================
+    #                  MAIN POD ANALYSIS PER FILE
+    # ============================================================
+    def POD_analysis(
+        self, xlsx_path: str | Path, file_name: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Decompose one operating-point snapshot matrix.
+
+        Snapshot matrix convention
+        --------------------------
+        A  shape = (n_dof, n_timesteps)
+          n_dof      = n_teeth × 2  (FR and FT stacked)
+          n_timesteps = number of rotor-angle samples in the xlsx
+
+        Returns U, s, Vt of the full SVD.
+        Appends flattened T_k to self.reg_Y and [rpm, torque] to self.reg_X.
+        Accumulates U_k for cross-OP averaging.
+        """
+        df = self.read_forces(xlsx_path)
+        rpm, torque = self.parse_operating_conditions(file_name)
+
+        # ── Normalise FR and FT groups independently ────────────
+        # Radial forces are typically 5-10× larger than tangential; without
+        # normalisation the first few POD modes are dominated by FR only.
+        fr_cols = [c for c in df.columns if c.startswith("FR_")]
+        ft_cols = [c for c in df.columns if c.startswith("FT_")]
+
+        df_norm = df.copy()
+        if fr_cols:
+            fr_std = df[fr_cols].values.std()
+            if fr_std > 0:
+                df_norm[fr_cols] /= fr_std
+        if ft_cols:
+            ft_std = df[ft_cols].values.std()
+            if ft_std > 0:
+                df_norm[ft_cols] /= ft_std
+
+        # A: rows = DOF (teeth × components), cols = time/angle steps
+        A = df_norm.to_numpy(dtype=float).T   # shape (n_dof, n_steps)
+        U, s, Vt = self.data_svd(A)
+
+        cum, loss = self.energy_curves(s)
+
+        k = self.mode_count
+        U_k = self._fix_sign_ambiguity(U[:, :k].copy())
+        T_k = s[:k, None] * Vt[:k, :]          # shape (k, n_steps)
+
+        # ── Log energy captured ─────────────────────────────────
+        e_pct = cum[k - 1] * 100
+        log.info(
+            "  %-35s  %4d rpm  %6.1f Nm  |  %d modes → %.2f %% energy",
+            os.path.basename(file_name), rpm, torque, k, e_pct,
+        )
+        if e_pct < 95.0:
+            log.warning(
+                "  Only %.1f %% energy captured with %d modes – consider increasing mode_count.",
+                e_pct, k,
+            )
+
+        # ── Shape bookkeeping (from first file) ─────────────────
+        if self.T_shape_tuple is None:
+            self.T_shape_tuple = T_k.shape
+            self.T_size = T_k.size
+
+        # ── Accumulate spatial basis for averaging ───────────────
+        if self._U_k_sum is None:
+            self._U_k_sum = U_k.copy()
+        else:
+            self._U_k_sum += U_k
+        self._U_k_count += 1
+
+        # ── Store training sample ────────────────────────────────
+        self.reg_X.append([rpm, torque])
+        self.reg_Y.append(T_k.flatten())
+
+        return U, s, Vt
+
+    # ============================================================
+    #                      ANN NETWORK (PyTorch)
+    # ============================================================
+    class _ANN(nn.Module):
+        """
+        2-input → hidden → output MLP.
+        BatchNorm after each hidden layer stabilises training when the
+        output dimensionality is large (thousands of temporal coefficients).
+        """
+
+        def __init__(self, input_dim: int, output_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.BatchNorm1d(64),
+                nn.SiLU(),
+                nn.Linear(64, 128),
+                nn.BatchNorm1d(128),
+                nn.SiLU(),
+                nn.Linear(128, 256),
+                nn.BatchNorm1d(256),
+                nn.SiLU(),
+                nn.Linear(256, 256),
+                nn.SiLU(),
+                nn.Linear(256, output_dim),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+
+    # ============================================================
+    #               TRAINING FUNCTION
+    # ============================================================
+    def train_mode_predictor(
+        self, test_size: float = 0.2, random_state: int = 42
+    ) -> dict:
+        """
+        Train ANN to map (rpm, torque) → flattened temporal coefficients T_k.
+        Spatial modes U_k are averaged across all OPs and stored as self.U_mean.
+
+        Returns
+        -------
+        dict with keys: rms, r2, train_loss_history, val_loss_history
+        """
+        if not self.reg_X:
+            raise ValueError("No POD data. Call run() first.")
+
+        # ── Finalise mean spatial basis ──────────────────────────
+        self.U_mean = self._U_k_sum / self._U_k_count
+
+        X = np.array(self.reg_X, dtype=np.float64)
+        Y = np.array(self.reg_Y, dtype=np.float64)
+
+        # ── Scale inputs and outputs ─────────────────────────────
+        X_s = self.x_scaler.fit_transform(X)
+        Y_s = self.y_scaler.fit_transform(Y)
+
+        X_train, X_test, Y_train, Y_test = train_test_split(
+            X_s, Y_s, test_size=test_size, random_state=random_state
+        )
+
+        to_t = lambda a: torch.tensor(a, dtype=torch.float32).to(self.device)  # noqa: E731
+        X_tr, Y_tr = to_t(X_train), to_t(Y_train)
+        X_te, Y_te = to_t(X_test), to_t(Y_test)
+
+        self.model = self._ANN(X.shape[1], Y.shape[1]).to(self.device)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=50, verbose=False
+        )
+        criterion = nn.MSELoss()
+
+        best_val_loss = float("inf")
+        best_state = None
+        train_hist, val_hist = [], []
+
+        for epoch in range(1, self.epochs + 1):
+            # ── Train step ───────────────────────────────────────
+            self.model.train()
+            optimizer.zero_grad()
+            loss_tr = criterion(self.model(X_tr), Y_tr)
+            loss_tr.backward()
+            optimizer.step()
+
+            # ── Validation step ──────────────────────────────────
+            self.model.eval()
+            with torch.no_grad():
+                loss_val = criterion(self.model(X_te), Y_te).item()
+
+            scheduler.step(loss_val)
+            train_hist.append(loss_tr.item())
+            val_hist.append(loss_val)
+
+            if loss_val < best_val_loss:
+                best_val_loss = loss_val
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+
+            if epoch % 100 == 0 or epoch == 1:
+                log.info(
+                    "Epoch %4d/%d  train=%.6f  val=%.6f  lr=%.2e",
+                    epoch, self.epochs, loss_tr.item(), loss_val,
+                    optimizer.param_groups[0]["lr"],
+                )
+
+        # ── Restore best weights ─────────────────────────────────
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+            log.info("Best validation loss %.6f restored.", best_val_loss)
+
+        # ── Final test metrics (in original scale) ───────────────
+        self.model.eval()
+        with torch.no_grad():
+            Y_pred_s = self.model(X_te).cpu().numpy()
+
+        Y_pred = self.y_scaler.inverse_transform(Y_pred_s)
+        Y_test_orig = self.y_scaler.inverse_transform(Y_test)
+
+        rms = float(np.sqrt(mean_squared_error(Y_test_orig, Y_pred)))
+        r2 = float(r2_score(Y_test_orig, Y_pred))
+        log.info("Test metrics → RMS=%.4f  R²=%.4f", rms, r2)
+
+        return {
+            "rms": rms,
+            "r2": r2,
+            "train_loss_history": train_hist,
+            "val_loss_history": val_hist,
+        }
+
+    def plot_training_history(self, history: dict) -> None:
+        """Visualise train vs validation loss curves."""
+        plt.figure(figsize=(10, 4))
+        plt.semilogy(history["train_loss_history"], label="Train loss")
+        plt.semilogy(history["val_loss_history"], label="Val loss", linestyle="--")
+        plt.xlabel("Epoch")
+        plt.ylabel("MSE loss (log scale)")
+        plt.title("ANN Training History")
+        plt.legend()
+        plt.grid(True, which="both")
+        plt.tight_layout()
+        plt.show()
+
+    # ============================================================
+    #            PREDICTION OF MODES FROM ANN
+    # ============================================================
+    def predict_modes(self, rpm: int, torque: float) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Predict temporal coefficients T_k for an unseen operating point.
+        Spatial modes U_k are taken from self.U_mean (averaged over training OPs).
+
+        Returns
+        -------
+        U_pred : ndarray, shape (n_dof, mode_count)
+        T_pred : ndarray, shape (mode_count, n_steps)
+        """
+        if self.model is None:
+            raise RuntimeError("Model not trained. Call train_mode_predictor() first.")
+        if self.U_mean is None:
+            raise RuntimeError("U_mean not set. Call run() and train_mode_predictor() first.")
+
+        X_raw = np.array([[rpm, torque]], dtype=np.float64)
+        X_s = self.x_scaler.transform(X_raw)
+        X_t = torch.tensor(X_s, dtype=torch.float32).to(self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            Y_s = self.model(X_t).cpu().numpy()
+
+        T_flat = self.y_scaler.inverse_transform(Y_s)[0]
+        T_pred = T_flat.reshape(self.T_shape_tuple)
+
+        return self.U_mean, T_pred
+
+    # ============================================================
+    #                  RECONSTRUCTION OF FIELD
+    # ============================================================
+    def reconstruct_field(self, U_pred: np.ndarray, T_pred: np.ndarray) -> np.ndarray:
+        """Return A_pred = U_pred @ T_pred, shape (n_dof, n_steps)."""
+        return U_pred @ T_pred
+
+    # ============================================================
+    #          SINGLE-TOOTH EVALUATION (PLOT + ERRORS)
+    # ============================================================
+    def evaluate_single_tooth(
+        self,
+        A_actual: np.ndarray,
+        A_pred: np.ndarray,
+        tooth_index: int,
+        rpm: int,
+        torque: float,
+        n_teeth: int | None = None,
+    ) -> dict:
+        """
+        Compare actual vs predicted force waveforms for one tooth.
+
+        Parameters
+        ----------
+        A_actual, A_pred : ndarray, shape (n_dof, n_steps)
+        tooth_index      : 0-based tooth number
+        n_teeth          : total number of teeth (used to split FR / FT rows).
+                           If None, only the first half is treated as FR.
+
+        Returns
+        -------
+        dict with rms and r2 for FR, FT, and combined.
+        """
+        if n_teeth is None:
+            n_teeth = A_actual.shape[0] // 2
+
+        fr_row = tooth_index            # FR row index
+        ft_row = n_teeth + tooth_index  # FT row index
+
+        results = {}
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        for ax, row, label, color in zip(
+            axes,
+            [fr_row, ft_row],
+            ["Radial (FR)", "Tangential (FT)"],
+            ["steelblue", "darkorange"],
+        ):
+            y_true = A_actual[row, :]
+            y_pred = A_pred[row, :]
+
+            rms = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+            r2  = float(r2_score(y_true, y_pred))
+            results[label] = {"rms": rms, "r2": r2}
+
+            ax.plot(y_true, label="FEM", linewidth=2, color=color)
+            ax.plot(y_pred, label="POD-ANN", linestyle="--", linewidth=2, color="black")
+            ax.set_ylabel(f"{label} Force (normalised)")
+            ax.set_title(f"{label}  |  RMS={rms:.4f}  R²={r2:.4f}")
+            ax.legend()
+            ax.grid(True)
+
+        axes[-1].set_xlabel("Rotor angle step")
+        fig.suptitle(
+            f"Tooth {tooth_index} Force Comparison | {rpm} rpm | {torque} Nm",
+            fontsize=13,
+        )
+        plt.tight_layout()
+        plt.show()
+
+        return results
+
+    # ============================================================
+    #                      MAIN RUN LOOP
+    # ============================================================
+    def run(self, data_dir_path: str | Path) -> dict:
+        """
+        Iterate over all xlsx files in data_dir_path, run POD_analysis on each,
+        and collect training data.  Files whose operating conditions cannot be
+        parsed, or whose (rpm, torque) pair is duplicated, are skipped.
+
+        Returns
+        -------
+        pod_results : dict keyed by (rpm, torque) →  {"U": ..., "s": ..., "Vt": ...}
+        """
+        data_dir = Path(data_dir_path)
+        files = sorted(glob.glob(str(data_dir / "*.xlsx")))
+
+        if not files:
+            raise FileNotFoundError(f"No xlsx files found in {data_dir_path}.")
+
+        log.info("Found %d xlsx file(s) in '%s'.", len(files), data_dir_path)
+
+        pod_results = {}
+        for filepath in files:
+            fname = os.path.basename(filepath)
+            rpm, torque = self.parse_operating_conditions(fname)
+
+            if rpm == -1 or np.isnan(torque):
+                continue  # warning already logged in parse_operating_conditions
+
+            op_key = (rpm, torque)
+            if op_key in self._seen_ops:
+                log.warning("Duplicate operating point %s in '%s' – skipping.", op_key, fname)
+                continue
+            self._seen_ops.add(op_key)
+
+            try:
+                U, s, Vt = self.POD_analysis(filepath, fname)
+                pod_results[op_key] = {"U": U, "s": s, "Vt": Vt}
+            except Exception as exc:
+                log.error("Failed to process '%s': %s", fname, exc)
+
+        log.info("POD complete. %d operating points collected.", len(pod_results))
+        return pod_results
+
+    # ============================================================
+    #                   PERSISTENCE HELPERS
+    # ============================================================
+    def save(self, path: str | Path) -> None:
+        """Save model weights + scalers + metadata to a .pt file."""
+        if self.model is None:
+            raise RuntimeError("Nothing to save – model not trained.")
+        torch.save(
+            {
+                "model_state": self.model.state_dict(),
+                "x_scaler": self.x_scaler,
+                "y_scaler": self.y_scaler,
+                "U_mean": self.U_mean,
+                "T_shape": self.T_shape_tuple,
+                "T_size": self.T_size,
+                "mode_count": self.mode_count,
+            },
+            path,
+        )
+        log.info("Model saved to '%s'.", path)
+
+    def load(self, path: str | Path) -> None:
+        """Restore a previously saved model."""
+        ckpt = torch.load(path, map_location=self.device)
+        self.x_scaler    = ckpt["x_scaler"]
+        self.y_scaler    = ckpt["y_scaler"]
+        self.U_mean      = ckpt["U_mean"]
+        self.T_shape_tuple = ckpt["T_shape"]
+        self.T_size      = ckpt["T_size"]
+        self.mode_count  = ckpt["mode_count"]
+
+        # Rebuild architecture and load weights
+        input_dim  = self.x_scaler.mean_.shape[0]
+        output_dim = self.T_size
+        self.model = self._ANN(input_dim, output_dim).to(self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.model.eval()
+        log.info("Model loaded from '%s'.", path)
